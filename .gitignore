@@ -1,0 +1,23 @@
+# Secrets
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Python
+backend/venv/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# SQLite preview DB
+backend/aiphoto.db
+backend/uploads_local/
+
+# Node
+**/node_modules/
+**/dist/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store

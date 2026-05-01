@@ -189,20 +189,42 @@ export function GeneratePage() {
                   <h3 className="font-semibold">选择 AI 引擎</h3>
                 </div>
                 <div className="space-y-2">
-                  {models?.map((model) => (
-                    <ModelCard
-                      key={model.id}
-                      model={model}
-                      selected={selectedModel?.id === model.id}
-                      onSelect={() => setModel(model)}
-                    />
-                  )) ?? (
+                  {models ? (() => {
+                    // 按 live > limited > mock 排序,内部按 creditMultiplier 升序
+                    const rank = (id: string) => ({live: 0, limited: 1, mock: 2}[
+                      MODEL_LIVE_STATUS[id]?.status ?? 'mock'
+                    ])
+                    const sorted = [...models].sort((a, b) => {
+                      const r = rank(a.id) - rank(b.id)
+                      return r !== 0 ? r : a.creditMultiplier - b.creditMultiplier
+                    })
+                    return sorted.map((model) => (
+                      <ModelCard
+                        key={model.id}
+                        model={model}
+                        selected={selectedModel?.id === model.id}
+                        onSelect={() => setModel(model)}
+                      />
+                    ))
+                  })() : (
                     <div className="space-y-2">
                       {Array.from({ length: 3 }, (_, i) => (
                         <div key={i} className="h-16 rounded-xl shimmer" />
                       ))}
                     </div>
                   )}
+                </div>
+                {/* 模型状态图例 */}
+                <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
+                  <span className="inline-flex items-center gap-1">
+                    <span className="h-1.5 w-1.5 rounded-full bg-green-500" /> 已接通真实 API
+                  </span>
+                  <span className="inline-flex items-center gap-1">
+                    <span className="h-1.5 w-1.5 rounded-full bg-amber-500" /> 受限(Key 限额/未开通)
+                  </span>
+                  <span className="inline-flex items-center gap-1">
+                    <span className="h-1.5 w-1.5 rounded-full bg-gray-400" /> Mock 占位
+                  </span>
                 </div>
               </CardContent>
             </Card>
@@ -455,12 +477,30 @@ const MODEL_ICON_EXT: Record<string, string> = {
   cogview_4: 'png',
   nano_banana: 'png',
   seedream_4: 'png',
+  seededit_3: 'png',
   flux_kontext: 'png',
   gpt_image_1: 'png',
   gpt_image_2: 'png',
   qwen_image: 'svg',
   kling_image: 'png',
   mj_v7: 'png',
+}
+
+// 模型当前真实接通状态(项目级已知,不需要后端动态算)
+type ModelLiveStatus = 'live' | 'limited' | 'mock'
+const MODEL_LIVE_STATUS: Record<string, { status: ModelLiveStatus; note?: string }> = {
+  // 真实接通且质量好,推荐
+  seedream_4:      { status: 'live', note: '中文 + 人脸保留首选' },
+  flux_kontext:    { status: 'live', note: '写实质感天花板' },
+  qwen_image:      { status: 'live', note: '图生图,人脸保留' },
+  kling_image:     { status: 'limited', note: '账号余额不足' },
+  // 受限
+  seededit_3:      { status: 'limited', note: '账号未开通' },
+  nano_banana:     { status: 'limited', note: '配额为 0' },
+  gpt_image_1:     { status: 'limited', note: '账单上限' },
+  gpt_image_2:     { status: 'limited', note: '账单上限' },
+  // Mock
+  mj_v7:           { status: 'mock' },
 }
 
 function ModelIcon({ modelId }: { modelId: string }) {
@@ -486,17 +526,20 @@ function ModelIcon({ modelId }: { modelId: string }) {
 }
 
 function ModelCard({ model, selected, onSelect }: { model: AIModel; selected: boolean; onSelect: () => void }) {
-  const statusColor = {
-    available: 'bg-green-500',
-    busy: 'bg-yellow-500',
-    maintenance: 'bg-red-500',
-  }[model.status]
+  const live = MODEL_LIVE_STATUS[model.id] ?? { status: 'mock' as const }
+  const isLive = live.status === 'live'
+  const isLimited = live.status === 'limited'
 
-  const statusText = {
-    available: '可用',
-    busy: '拥挤',
-    maintenance: '维护中',
-  }[model.status]
+  const badgeStyle = {
+    live:    'bg-green-100 text-green-700 border-green-200',
+    limited: 'bg-amber-100 text-amber-700 border-amber-200',
+    mock:    'bg-gray-100 text-gray-500 border-gray-200',
+  }[live.status]
+  const badgeText = {
+    live:    '推荐',
+    limited: '受限',
+    mock:    'Mock',
+  }[live.status]
 
   return (
     <button
@@ -507,16 +550,26 @@ function ModelCard({ model, selected, onSelect }: { model: AIModel; selected: bo
         selected ? 'border-primary bg-primary/5' : 'hover:border-primary/40 hover:bg-muted/30',
         model.status === 'maintenance' && 'opacity-50 pointer-events-none',
       )}
+      title={live.note ?? ''}
     >
       <ModelIcon modelId={model.id} />
 
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 flex-wrap">
           <span className="text-sm font-medium">{model.displayName}</span>
-          <span className={cn('h-1.5 w-1.5 rounded-full', statusColor)} />
-          <span className="text-xs text-muted-foreground">{statusText}</span>
+          <span className={cn(
+            'inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded-md border',
+            badgeStyle,
+          )}>
+            {isLive && <span className="h-1.5 w-1.5 rounded-full bg-green-500" />}
+            {badgeText}
+          </span>
         </div>
-        <p className="text-xs text-muted-foreground mt-0.5 truncate">{model.description}</p>
+        <p className="text-xs text-muted-foreground mt-0.5 truncate">
+          {isLimited && live.note ? <span className="text-amber-600">{live.note} · </span> : null}
+          {isLive && live.note ? <span className="text-green-700">{live.note} · </span> : null}
+          {model.description}
+        </p>
       </div>
       <div className="shrink-0 text-right">
         <div className="text-xs font-medium text-primary">{model.creditMultiplier}x</div>

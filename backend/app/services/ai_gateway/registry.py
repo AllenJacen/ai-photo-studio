@@ -3,6 +3,7 @@ from app.services.ai_gateway.base import AIProviderBase, ProviderStatus
 from app.services.ai_gateway.providers import (
     NanoBananaProvider,
     SeedreamProvider,
+    SeedEditProvider,
     FluxKontextProvider,
     GPTImage1Provider,
     GPTImage2Provider,
@@ -18,6 +19,7 @@ _PROVIDERS: dict[str, AIProviderBase] = {
     "cogview_4": CogView4Provider(),
     "nano_banana": NanoBananaProvider(),
     "seedream_4": SeedreamProvider(),
+    "seededit_3": SeedEditProvider(),
     "flux_kontext": FluxKontextProvider(),
     "gpt_image_1": GPTImage1Provider(),
     "gpt_image_2": GPTImage2Provider(),
@@ -26,7 +28,7 @@ _PROVIDERS: dict[str, AIProviderBase] = {
     "mj_v7": MidjourneyV7Provider(),
 }
 
-FALLBACK_ORDER = ["cogview_3_flash", "nano_banana", "seedream_4", "flux_kontext", "gpt_image_2", "gpt_image_1"]
+FALLBACK_ORDER = ["cogview_3_flash", "qwen_image", "seedream_4", "flux_kontext", "nano_banana", "gpt_image_2", "gpt_image_1"]
 
 
 def get_provider(model_id: str) -> AIProviderBase:

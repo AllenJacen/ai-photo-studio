@@ -119,12 +119,19 @@ def run_generation_sync(task_id: str) -> dict:
             scene_recommended=scene.recommended_model if scene else None,
             scene_supported=scene.supported_models if scene else None,
         ))
-        result = asyncio.run(provider.generate(
-            source_images=source_images,
-            prompt=task.final_prompt or "",
-            negative_prompt=task.negative_prompt or "",
-            params=gen_params,
-        ))
+
+        # 给 provider.generate 加全局超时(防止 provider 内部卡死,任务永久 processing)
+        async def _gen_with_timeout():
+            return await asyncio.wait_for(
+                provider.generate(
+                    source_images=source_images,
+                    prompt=task.final_prompt or "",
+                    negative_prompt=task.negative_prompt or "",
+                    params=gen_params,
+                ),
+                timeout=300,  # 5 分钟硬超时
+            )
+        result = asyncio.run(_gen_with_timeout())
 
         # --- Stage 3: postprocessing ---
         _update_task(db, task, progress=80, current_stage="postprocessing")

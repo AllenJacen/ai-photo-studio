@@ -122,39 +122,93 @@ class NanoBananaProvider(AIProviderBase):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 字节豆包 — Seedream 4.0
+# 字节豆包 — Seedream 4.0 / 4.5(文生图为主,可传 image 参数做图生图)
+# 火山方舟 ARK API,OpenAI 兼容格式
 # ──────────────────────────────────────────────────────────────────────────────
-class SeedreamProvider(AIProviderBase):
-    @property
-    def model_id(self) -> str:
-        return "seedream_4"
+class _ArkImageBase(AIProviderBase):
+    """字节豆包图像模型基类(火山方舟 ARK)。子类只需定义 ark_model_id。"""
+    ark_model_id: str = "doubao-seedream-4-0-250828"
 
     async def generate(self, source_images, prompt, negative_prompt, params):
         start = time.time()
-        if not _api_key("ARK_API_KEY"):
-            return _mock_result("seedream", params, start)
-        async with httpx.AsyncClient(timeout=180) as client:
+        api_key = _api_key("ARK_API_KEY")
+        if not api_key:
+            return _mock_result(self.ark_model_id, params, start)
+
+        # 拼装 reference image:支持 URL 或 base64 → data URL
+        primary = next((s for s in (source_images or []) if s.base64 or s.url), None)
+        ref_image = None
+        if primary:
+            ref_image = primary.url or f"data:image/jpeg;base64,{primary.base64}" if primary.base64 else None
+
+        # ARK 支持的 size:1024x1024 / 2K(2048) / 4K 等档位
+        size = f"{params.width}x{params.height}"
+        if params.width == params.height == 1024:
+            size = "1024x1024"
+        elif max(params.width, params.height) >= 2048:
+            size = "2K"
+
+        body: dict = {
+            "model": self.ark_model_id,
+            "prompt": prompt,
+            "size": size,
+            "response_format": "url",
+            "watermark": False,
+        }
+        # 图生图:ARK 用 image(单图)字段
+        if ref_image:
+            body["image"] = ref_image
+
+        async def _call_once(client: httpx.AsyncClient) -> list[str]:
             r = await client.post(
                 "https://ark.cn-beijing.volces.com/api/v3/images/generations",
-                headers={"Authorization": f"Bearer {_api_key('ARK_API_KEY')}"},
-                json={
-                    "model": "doubao-seedream-4-0-250828",
-                    "prompt": prompt,
-                    "size": f"{params.width}x{params.height}",
-                    "n": params.output_count,
-                },
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=body,
             )
-            r.raise_for_status()
+            if r.status_code >= 400:
+                raise RuntimeError(f"ARK {self.ark_model_id} API {r.status_code}: {r.text[:300]}")
             data = r.json()
-            urls = [item["url"] for item in data.get("data", [])]
+            return [item["url"] for item in data.get("data", []) if item.get("url")]
+
+        async with httpx.AsyncClient(timeout=300) as client:
+            tasks = [_call_once(client) for _ in range(max(1, params.output_count))]
+            all_results = await asyncio.gather(*tasks, return_exceptions=True)
+            urls: list[str] = []
+            errors: list[str] = []
+            for res in all_results:
+                if isinstance(res, Exception):
+                    errors.append(str(res))
+                else:
+                    urls.extend(res)
+            if not urls:
+                raise RuntimeError(f"ARK {self.ark_model_id} returned no images. Errors: {errors[:2]}")
             return GenerationResult(image_urls=urls, generation_time_ms=int((time.time() - start) * 1000))
 
     async def health_check(self) -> ProviderStatus:
         return ProviderStatus.AVAILABLE
 
 
+class SeedreamProvider(_ArkImageBase):
+    """Seedream 4.0 — 字节文生图旗舰,中文场景理解强"""
+    ark_model_id = "doubao-seedream-4-0-250828"
+
+    @property
+    def model_id(self) -> str:
+        return "seedream_4"
+
+
+class SeedEditProvider(_ArkImageBase):
+    """SeedEdit 3.0 — 字节图像编辑专用,主体保留 + 局部编辑"""
+    ark_model_id = "doubao-seededit-3-0-i2i-250628"
+
+    @property
+    def model_id(self) -> str:
+        return "seededit_3"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Black Forest Labs — Flux Kontext Pro (img2img / 编辑能力)
+# Black Forest Labs — Flux Kontext Pro (img2img / 人脸保持编辑)
+# Replicate 端点:同步等待用 Prefer:wait;异步则需轮询 prediction_id
 # ──────────────────────────────────────────────────────────────────────────────
 class FluxKontextProvider(AIProviderBase):
     @property
@@ -163,25 +217,89 @@ class FluxKontextProvider(AIProviderBase):
 
     async def generate(self, source_images, prompt, negative_prompt, params):
         start = time.time()
-        if not _api_key("REPLICATE_API_TOKEN"):
+        api_key = _api_key("REPLICATE_API_TOKEN")
+        if not api_key:
             return _mock_result("flux-kontext", params, start)
-        input_data = {
+
+        # 支持 URL 与 base64 两种源图(worker 现在统一传 base64)
+        primary = next((s for s in (source_images or []) if s.base64 or s.url), None)
+        input_image_field = None
+        if primary:
+            if primary.url:
+                input_image_field = primary.url
+            elif primary.base64:
+                # Replicate 接受 data URL
+                input_image_field = f"data:image/jpeg;base64,{primary.base64}"
+
+        # 算 Flux 支持的 aspect ratio(img2img 时可以 match_input_image)
+        if input_image_field:
+            aspect = "match_input_image"
+        else:
+            ratio = params.width / params.height if params.height else 1
+            aspect = "1:1"
+            for label, val in [("1:1", 1), ("3:4", 0.75), ("4:3", 1.33), ("9:16", 0.5625), ("16:9", 1.78), ("2:3", 0.667), ("3:2", 1.5)]:
+                if abs(ratio - val) < abs(ratio - {"1:1": 1, "3:4": 0.75, "4:3": 1.33, "9:16": 0.5625, "16:9": 1.78, "2:3": 0.667, "3:2": 1.5}[aspect]):
+                    aspect = label
+
+        input_data: dict = {
             "prompt": prompt,
-            "aspect_ratio": "match_input_image" if source_images and source_images[0].url else "3:4",
+            "aspect_ratio": aspect,
             "output_format": "jpg",
+            "safety_tolerance": 2,
         }
-        if source_images and source_images[0].url:
-            input_data["input_image"] = source_images[0].url
-        async with httpx.AsyncClient(timeout=300) as client:
+        if input_image_field:
+            input_data["input_image"] = input_image_field
+
+        # 多张输出 — Flux Kontext 单次只回 1 张,要多张就并发调用
+        async def _call_once(client: httpx.AsyncClient) -> list[str]:
             r = await client.post(
                 "https://api.replicate.com/v1/models/black-forest-labs/flux-kontext-pro/predictions",
                 json={"input": input_data},
-                headers={"Authorization": f"Token {_api_key('REPLICATE_API_TOKEN')}", "Prefer": "wait"},
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "Prefer": "wait=60",  # 同步最多等 60s,超时后转异步轮询
+                },
             )
-            r.raise_for_status()
+            if r.status_code not in (200, 201):
+                raise RuntimeError(f"Flux Kontext API {r.status_code}: {r.text[:300]}")
             data = r.json()
-            output = data.get("output")
-            urls = output if isinstance(output, list) else [output] if output else []
+
+            # 已直接返回 succeeded
+            if data.get("status") == "succeeded":
+                output = data.get("output")
+                return output if isinstance(output, list) else ([output] if output else [])
+
+            # 否则轮询 prediction_id 直到 completed
+            prediction_id = data.get("id")
+            if not prediction_id:
+                raise RuntimeError(f"Flux Kontext: no prediction id in {data}")
+            for _ in range(60):  # 最多再等 5 分钟
+                await asyncio.sleep(5)
+                poll = await client.get(
+                    f"https://api.replicate.com/v1/predictions/{prediction_id}",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                pdata = poll.json()
+                if pdata.get("status") == "succeeded":
+                    output = pdata.get("output")
+                    return output if isinstance(output, list) else ([output] if output else [])
+                if pdata.get("status") in ("failed", "canceled"):
+                    raise RuntimeError(f"Flux Kontext failed: {pdata.get('error')}")
+            raise RuntimeError("Flux Kontext polling timed out")
+
+        async with httpx.AsyncClient(timeout=600) as client:
+            tasks = [_call_once(client) for _ in range(max(1, params.output_count))]
+            all_results = await asyncio.gather(*tasks, return_exceptions=True)
+            urls: list[str] = []
+            errors: list[str] = []
+            for res in all_results:
+                if isinstance(res, Exception):
+                    errors.append(str(res))
+                else:
+                    urls.extend(res)
+            if not urls:
+                raise RuntimeError(f"Flux Kontext returned no images. Errors: {errors[:2]}")
             return GenerationResult(image_urls=urls, generation_time_ms=int((time.time() - start) * 1000))
 
     async def health_check(self) -> ProviderStatus:
@@ -408,17 +526,105 @@ class QwenImageProvider(AIProviderBase):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 快手 — Kling Image (可灵图像)
+# 快手 — Kling Image v1.5(可灵图像)— JWT 鉴权 + 异步任务
 # ──────────────────────────────────────────────────────────────────────────────
 class KlingImageProvider(AIProviderBase):
     @property
     def model_id(self) -> str:
         return "kling_image"
 
+    @staticmethod
+    def _make_jwt(access_key: str, secret_key: str) -> str:
+        """可灵 API 用 JWT 鉴权:HS256 签名,exp 30 分钟,nbf -5 秒。"""
+        import jwt as _jwt  # PyJWT
+        import time as _t
+        payload = {
+            "iss": access_key,
+            "exp": int(_t.time()) + 1800,
+            "nbf": int(_t.time()) - 5,
+        }
+        return _jwt.encode(payload, secret_key, algorithm="HS256", headers={"alg": "HS256", "typ": "JWT"})
+
     async def generate(self, source_images, prompt, negative_prompt, params):
         start = time.time()
-        # 可灵签名鉴权较复杂(JWT),Mock 优先
-        return _mock_result("kling", params, start)
+        ak = _api_key("KLING_ACCESS_KEY")
+        sk = _api_key("KLING_SECRET_KEY")
+        if not ak or not sk:
+            return _mock_result("kling", params, start)
+
+        try:
+            token = self._make_jwt(ak, sk)
+        except Exception as e:
+            raise RuntimeError(f"Kling JWT 生成失败(检查 PyJWT 是否安装): {e}")
+
+        primary = next((s for s in (source_images or []) if s.base64 or s.url), None)
+
+        body: dict = {
+            "model_name": "kling-v1-5",
+            "prompt": prompt,
+            "negative_prompt": negative_prompt or "",
+            "aspect_ratio": "3:4",
+            "n": 1,  # 单次 1 张,多张并发
+        }
+        # 计算 aspect_ratio
+        ratio = params.width / params.height if params.height else 1
+        for label, val in [("1:1", 1), ("16:9", 1.78), ("9:16", 0.5625), ("4:3", 1.33), ("3:4", 0.75), ("3:2", 1.5), ("2:3", 0.667)]:
+            if abs(ratio - val) < abs(ratio - {"1:1": 1, "16:9": 1.78, "9:16": 0.5625, "4:3": 1.33, "3:4": 0.75, "3:2": 1.5, "2:3": 0.667}[body["aspect_ratio"]]):
+                body["aspect_ratio"] = label
+
+        if primary:
+            if primary.url:
+                body["image"] = primary.url
+            elif primary.base64:
+                body["image"] = primary.base64  # 可灵接受裸 base64
+            # 关键:可灵 v1.5 要求带 image 时必须指定 reference 用途
+            # "face" = 人脸保留(我们的婚纱艺术照场景),"subject" = 主体保留
+            body["image_reference"] = "face"
+            body["image_fidelity"] = 0.5  # 0~1,越大越像原图(人脸保留度)
+
+        async def _call_once(client: httpx.AsyncClient) -> list[str]:
+            # 1. 提交任务
+            r = await client.post(
+                "https://api-beijing.klingai.com/v1/images/generations",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=body,
+            )
+            if r.status_code >= 400:
+                raise RuntimeError(f"Kling submit error {r.status_code}: {r.text[:300]}")
+            data = r.json()
+            task_id = data.get("data", {}).get("task_id")
+            if not task_id:
+                raise RuntimeError(f"Kling: no task_id in {data}")
+
+            # 2. 轮询任务结果
+            for _ in range(60):  # 最多 5 分钟
+                await asyncio.sleep(5)
+                poll = await client.get(
+                    f"https://api-beijing.klingai.com/v1/images/generations/{task_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                pdata = poll.json().get("data", {})
+                status = pdata.get("task_status", "")
+                if status == "succeed":
+                    images = pdata.get("task_result", {}).get("images", [])
+                    return [img["url"] for img in images if img.get("url")]
+                if status == "failed":
+                    raise RuntimeError(f"Kling task failed: {pdata.get('task_status_msg')}")
+            raise RuntimeError("Kling polling timed out")
+
+        async with httpx.AsyncClient(timeout=600) as client:
+            tasks = [_call_once(client) for _ in range(max(1, params.output_count))]
+            all_results = await asyncio.gather(*tasks, return_exceptions=True)
+            urls: list[str] = []
+            errors: list[str] = []
+            for res in all_results:
+                if isinstance(res, Exception):
+                    errors.append(str(res))
+                else:
+                    urls.extend(res)
+            if not urls:
+                raise RuntimeError(f"Kling returned no images. Errors: {errors[:2]}")
+            return GenerationResult(image_urls=urls, generation_time_ms=int((time.time() - start) * 1000))
 
     async def health_check(self) -> ProviderStatus:
         return ProviderStatus.AVAILABLE
